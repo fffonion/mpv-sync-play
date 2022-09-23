@@ -107,7 +107,8 @@ local function post(args, body, url)
   end
 end
 
-local RPC = {
+local RPC
+RPC = {
   play = function(url)
     mp.msg.info("stream open filename ", mp.get_property_native("stream-open-filename", "") )
     if mp.get_property_native("stream-open-filename", "") ~= url then
@@ -125,15 +126,24 @@ local RPC = {
     -- mp.set_property_native("pause", pause)
   end,
 
+  position_adjust_cooldown = 0,
   position = function(position_str)
     local position, ts = position_str:match("^([%d%.]+)%|([%d%.]+)$")
-    position = mp.get_time_ms() - ts + position
+    position = os.time() - ts + position
     local cur = mp.get_property_native("time-pos")
     if not cur or math.abs(position - cur) > 1 then
-      mp.msg.info("adjusting position: " .. position)
-      mp.set_property_native("time-pos", position)
+      if os.time() - RPC.position_adjust_cooldown > 1 then -- cooldown
+        mp.msg.info("adjusting position: " .. position)
+        mp.set_property_native("time-pos", position)
+      end
     end
   end,
+
+  track = function (track_str)
+    local aid, sid = track_str:match("^([^|]*)%|([^|]*)$")
+    mp.set_property_native("aid", tonumber(aid))
+    mp.set_property_native("sid", tonumber(sid))
+  end
 }
 
 local BROKER = {}
@@ -145,6 +155,7 @@ function BROKER.new(options)
     tbl[k] = v
   end
   tbl.is_host = true -- default to host
+  tbl.sync_down_cooldown = 0
   return setmetatable(tbl, {__index = BROKER})
 end
 
@@ -159,29 +170,29 @@ function BROKER:rpc(method, ...)
 
   local ret, err = post(self.cmd, body, self.broker_url .. "/" .. self.room_id)
   if err then
-    mp.msg.error("RPC request error: " .. err)
+    mp.msg.error("RPC: " .. method .. " request error: " .. err)
     return
   end
 
   local decoded, err = utils.parse_json(ret)
   if err then
-    mp.msg.error("RPC parse error: " .. err .. " raw body is: ".. ret)
+    mp.msg.error("RPC: " .. method .. " parse error: " .. err .. " raw body is: ".. ret)
     return
   end
   if decoded.code > 0 then
-    mp.msg.error("RPC return error: " .. decoded.code .. ", message: " .. decoded.error)
+    mp.msg.error("RPC: " .. method .. " return error: " .. decoded.code .. ", message: " .. decoded.error)
     return
   end
 
-  mp.msg.verbose("RPC: OK")
+  mp.msg.verbose("RPC: " .. method .. " OK")
 
   return decoded.data
 end
 
 
 function sleep(time)
-	local now = mp.get_time_ms()
-	repeat until (mp.get_time_ms() - now > time)
+	local now = os.time()
+	repeat until (os.time() - now > time)
 end
 
 function BROKER:join()
@@ -198,10 +209,9 @@ end
 function BROKER:sync_up()
   if mp.get_property("seekable") and self.is_host then
     local position = mp.get_property_number("time-pos")
-    local url = mp.get_property("stream-open-filename", "")
     local pause = mp.get_property_native("pause")
     if position ~= nil then
-      self:rpc("sync", ident, position, mp.get_time_ms(), url, pause)
+      self:rpc("sync", ident, position, os.time(), pause)
     end
   end
 end
@@ -210,6 +220,11 @@ function BROKER:sync_down(interval)
   if self.is_host then
     return
   end
+
+  if os.time() - self.sync_down_cooldown < 1 then
+    return
+  end
+  self.sync_down_cooldown = os.time()
 
   local start_play = false
   local state, err = self:rpc("get_state", interval)
@@ -239,6 +254,14 @@ function BROKER:sync_down(interval)
   end
 
   return start_play
+end
+
+function BROKER:track()
+  if self.is_host then
+      local aid = mp.get_property_number("current-tracks/audio/id") or 0
+      local sid = mp.get_property_number("current-tracks/sub/id") or 0
+      self:rpc("track", aid, sid)
+  end
 end
 
 function BROKER:check_lazy_reposition()
@@ -282,12 +305,19 @@ local function init()
   mp.msg.info("script loaded, default broker: " .. broker.broker_url .. "/" .. broker.room_id)
 
   local prefix = "broker://"
+  local last_aid, last_sid = 1, nil
+
+  local function is_audience()
+    local url = mp.get_property("stream-open-filename", "")
+    return url:find(prefix) == 1
+  end
 
   mp.add_hook("on_load_fail", 10, function()
-    local url = mp.get_property("stream-open-filename", "")
-    if not (url:find(prefix) == 1) then
+    if not is_audience() then
       return
     end
+
+    local url = mp.get_property("stream-open-filename", "")
     broker.is_host = false
     broker:join(string.sub(url, #prefix+2))
   end)
@@ -303,6 +333,7 @@ local function init()
   --   -- end file
   -- end)
 
+  --     // https://github.com/mpv-player/mpv/blob/master/DOCS/man/input.rst
   mp.observe_property("pause", "bool", function(name, value)
     broker:rpc("pause", value)
   end)
@@ -322,6 +353,29 @@ local function init()
 
   mp.register_event("file-loaded", function()
     broker:check_lazy_reposition()
+  end)
+
+  mp.observe_property("current-tracks/audio/id", "number", function(name, value)
+    if is_audience() then
+      return
+    end
+
+    if value ~= last_aid then
+        mp.msg.info("audio track changed: ", value)
+        broker:track()
+        last_aid = value
+    end
+  end)
+  mp.observe_property("current-tracks/sub/id", "number", function(name, value)
+    if is_audience() then
+      return
+    end
+  
+    if value ~= last_sid then
+        mp.msg.info("subtitle track changed: ", value)
+        broker:track()
+        last_sid = value
+    end
   end)
 
   -- blocking query

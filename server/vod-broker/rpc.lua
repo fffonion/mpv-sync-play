@@ -18,7 +18,7 @@ function RPC.pause(room, pause)
   post_update(room)
 end
 
-function RPC.sync(room, ident, position, ts, url, pause)
+function RPC.sync(room, ident, position, ts, pause)
   local ok, err = shm:add(room .. ":host", ident, 60)
   shm:expire(room .. ":host", 60) -- refresh ttl
 
@@ -26,12 +26,22 @@ function RPC.sync(room, ident, position, ts, url, pause)
   position = position + ngx.now() - ts -- amend network latency
   shm:set(room .. ":position", position .. "|" .. ngx.now(), TTL)
 
-  RPC.play(room, url)
   RPC.pause(room, pause)
 
   post_update(room)
 
   return RPC.get_state(room, 0)
+end
+
+function RPC.track(room, aid, sid)
+  if aid == ngx.null then
+    aid = ""
+  end
+  if sid == ngx.null then
+    sid = ""
+  end
+  shm:set(room .. ":track", aid .. "|" .. sid)
+  post_update(room)
 end
 
 function RPC.get_state(room, wait)
@@ -42,7 +52,7 @@ function RPC.get_state(room, wait)
     end
     ngx.sleep(0.2)
   end
-  local states = { "play", "position", "pause", "host" }
+  local states = { "play", "position", "pause", "host", "track" }
   local ret = {}
   for _, k in ipairs(states) do
     local v, err = shm:get(room .. ":" .. k)

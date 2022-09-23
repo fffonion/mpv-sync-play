@@ -119,6 +119,7 @@ var RPC = {
         // mp.set_property_native("pause", pause)
     },
 
+    positionAdjustCooldown: 0,
     position: function (position_str) {
         var parts = position_str.split("|")
         var position = parseFloat(parts[0])
@@ -126,9 +127,18 @@ var RPC = {
         position = Date.now()/1000 - ts + position
         var cur = mp.get_property_native("time-pos")
         if (!cur || Math.abs(position - cur) > 1) {
-            mp.msg.info("adjusting position: " + position)
-            mp.set_property_native("time-pos", position)
+            if (Date.now() - RPC.positionAdjustCooldown > 1000) { // cooldown
+                RPC.positionAdjustCooldown = Date.now()
+                mp.msg.info("adjusting position: " + position)
+                mp.set_property_native("time-pos", position)
+            }
         }
+    },
+
+    track: function (track_str) {
+        var parts = track_str.split("|")
+        mp.set_property_native("aid", parseInt(parts[0]))
+        mp.set_property_native("sid", parseInt(parts[1]))
     },
 }
 
@@ -141,8 +151,9 @@ var BROKER = function (options) {
     this.room_id = options.room_id
     this.sync_interval = options.sync_interval
 
-    this.is_host = true // default to host
-    this.lazy_reposition = false
+    this.isHost = true // default to host
+    this.syncDownCooldown = 0
+    this.lazyReposition = false
 }
 
 BROKER.prototype.rpc = function (method, args) {
@@ -164,23 +175,23 @@ BROKER.prototype.rpc = function (method, args) {
     try {
         var ret = post(this.cmd, body, this.broker_url + "/" + this.room_id)
     } catch (e) {
-        mp.msg.error("RPC request error: " + e)
+        mp.msg.error("RPC: " + method + " request error: " + e)
         return
     }
 
     try {
         var decoded = JSON.parse(ret)
     } catch (e) {
-        mp.msg.error("RPC parse error: " + e + " raw body is: " + ret)
+        mp.msg.error("RPC: " + method + " parse error: " + e + " raw body is: " + ret)
         return
     }
 
     if (decoded.code > 0) {
-        mp.msg.error("RPC return error: " + decoded.code + ", message: " + decoded.error)
+        mp.msg.error("RPC: " + method + " return error: " + decoded.code + ", message: " + decoded.error)
         return
     }
 
-    mp.msg.verbose("RPC: OK " + ret)
+    mp.msg.verbose("RPC: " + method + " OK " + ret)
 
     return decoded.data
 }
@@ -203,20 +214,24 @@ BROKER.prototype.join = function () {
 }
 
 BROKER.prototype.syncUp = function () {
-    if (mp.get_property("seekable") && this.is_host) {
+    if (mp.get_property("seekable") && this.isHost) {
         var position = mp.get_property_number("time-pos")
-        var url = mp.get_property("stream-open-filename", "")
         var pause = mp.get_property_native("pause")
         if (position != undefined) {
-            this.rpc("sync", [ ident, position, Date.now()/1000, url, pause ])
+            this.rpc("sync", [ ident, position, Date.now()/1000, pause ])
         }
     }
 }
 
 BROKER.prototype.syncDown = function (interval) {
-    if (this.is_host) {
+    if (this.isHost) {
         return
     }
+
+    if (Date.now() - this.syncDownCooldown < 1000) {
+        return
+    }
+    this.syncDownCooldown = Date.now()
 
     var start_play = false
     var state = this.rpc("get_state", interval? [ interval ] : [])
@@ -228,16 +243,16 @@ BROKER.prototype.syncDown = function (interval) {
             if (s[0] == "play") {
                 start_play = true
             } else if (s[0] == "position") {
-                this.lazy_reposition = s[1]
+                this.lazyReposition = s[1]
             }
             if (s[0] == "host") {
                 if (s[1] == ident) {
-                    if (!this.is_host) {
+                    if (!this.isHost) {
                         mp.osd_message("claimed the host", 3)
                         mp.msg.info("claimed the host")
                     }
                 }
-                this.is_host = s[1] == ident
+                this.isHost = s[1] == ident
             } else if (RPC[s[0]]) {
                 RPC[s[0]](s[1])
             } else
@@ -248,16 +263,24 @@ BROKER.prototype.syncDown = function (interval) {
     return start_play
 }
 
+BROKER.prototype.track = function () {
+    if (this.isHost) {
+        var aid = mp.get_property_number("current-tracks/audio/id") || 0
+        var sid = mp.get_property_number("current-tracks/sub/id") || 0
+        this.rpc("track", [ aid, sid ])
+    }
+}
+
 BROKER.prototype.checkLazyReposition = function () {
-    if (this.lazy_reposition) {
-        mp.msg.info("lazy reposition: " + this.lazy_reposition)
-        RPC.position(this.lazy_reposition)
-        this.lazy_reposition = false
+    if (this.lazyReposition) {
+        mp.msg.info("lazy reposition: " + this.lazyReposition)
+        RPC.position(this.lazyReposition)
+        this.lazyReposition = false
     }
 }
 
 
-(function () {
+//(function () {
     var userConfig = {
         broker_url: "http://broker.vod.yooooo.us",
         room_id: 1,
@@ -282,12 +305,16 @@ BROKER.prototype.checkLazyReposition = function () {
 
     var prefix = "broker://"
 
+    function isAudience() {
+        var url = mp.get_property("stream-open-filename", "")
+        return url.search(prefix) != -1
+    }
+
     mp.add_hook("on_load_fail", 10, function () {
         var url = mp.get_property("stream-open-filename", "")
-        if (url.search(prefix) == -1) {
-            return
-        }
-        broker.is_host = false
+        if (!isAudience()) return
+
+        broker.isHost = false
         broker.join(url.substring(prefix.length + 2))
     })
 
@@ -302,6 +329,7 @@ BROKER.prototype.checkLazyReposition = function () {
     //   // } file
     // })
 
+    // https://github.com/mpv-player/mpv/blob/master/DOCS/man/input.rst
     mp.observe_property("pause", "bool", function (name, value) {
         broker.rpc("pause", [ value ])
     })
@@ -319,6 +347,26 @@ BROKER.prototype.checkLazyReposition = function () {
         }
     })
 
+    var last_aid = 1, last_sid = undefined // default subtitle is none
+    mp.observe_property("current-tracks/audio/id", "number", function(name, value) {
+        if (value != last_aid) {
+            if (isAudience()) return
+
+            mp.msg.info("audio track changed: " + value)
+            broker.track()
+            last_aid = value
+        }
+    })
+    mp.observe_property("current-tracks/sub/id", "number", function(name, value) {
+        if (value != last_sid) {
+            if (isAudience()) return
+
+            mp.msg.info("subtitle track changed: " + value)
+            broker.track()
+            last_sid = value
+        }
+    })
+
     mp.register_event("file-loaded", function () {
         broker.checkLazyReposition()
     })
@@ -332,4 +380,4 @@ BROKER.prototype.checkLazyReposition = function () {
     var timer2 = setInterval(function () {
         broker.syncUp()
     }, userConfig.sync_interval * 1000)
-})();
+//})();
